@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from gptqmodel.nn_modules.qlinear import BaseQuantLinear
+from torch import Tensor
 
 logger = getLogger(__name__)
 
@@ -71,6 +72,40 @@ def unpack_qzeros(qzeros, bits):
 
     return unpacked_zeros
 
+def unpack_qweight(qweight, bits):
+    qweight = qweight.view(torch.int8)
+    elems_per_int8 = 8 // bits
+    unpacked_weight = torch.zeros(
+        (qweight.shape[0], qweight.shape[1] * elems_per_int8),
+        dtype=torch.int8,
+        device=qweight.device,
+        requires_grad=False,
+    )
+    for col in range(unpacked_weight.shape[1]):
+        i = col % elems_per_int8
+        unpacked_weight[:, col] = (qweight[:, col // elems_per_int8] >> (bits * i))
+
+    return torch.bitwise_and(unpacked_weight, 2**bits - 1)
+    
+@torch.library.custom_op("bitblas::matmul_bitblas", mutates_args=())
+def matmul_bitblas(
+    x: Tensor, W_q: Tensor, scale: Tensor, zero: Tensor, out_features: int, eng_tag: str,
+) -> Tensor:
+
+    origin_x_size = x.size()
+    c = BitBLASQuantLinear.ENG_CACHE[eng_tag](x, W_q, scale=scale, zeros=zero)
+    new_shape = origin_x_size[:-1] + (out_features,)
+    c = c.reshape(new_shape)
+    return c
+
+
+@torch.library.register_fake("bitblas::matmul_bitblas")
+def matmul_bitblas_fake(
+    x: Tensor, W_q: Tensor, scale: Tensor, zero: Tensor, out_features: int, eng_tag: str,
+) -> Tensor:
+    return torch.empty(
+        [x.shape[0], x.shape[1], out_features], device=W_q.device, dtype=scale.dtype
+    )
 
 class BitBLASQuantLinear(BaseQuantLinear):
     SUPPORTS_BITS = [1, 2, 4]
@@ -79,7 +114,7 @@ class BitBLASQuantLinear(BaseQuantLinear):
     SUPPORTS_IN_FEATURES_DIVISIBLE_BY = [16]
     SUPPORTS_OUT_FEATURES_DIVISIBLE_BY = [16]
 
-    OPT_FEATURES = [1, 16, 32, 64, 128, 256, 512]
+    OPT_FEATURES = [1, 4, 5, 6, 16, 32, 64, 128, 256, 512]
     zeros_mode = "quantized"  # "original" or "rescale" or "quantized"
     TORCH_DTYPE = torch.float16
     STORAGE_DTYPE = "int8"  # assume int8 storage
@@ -91,6 +126,8 @@ class BitBLASQuantLinear(BaseQuantLinear):
         torch.int8: "int8",
     }
 
+    ENG_CACHE = {}
+    
     def __init__(
         self,
         bits: int,
@@ -119,11 +156,16 @@ class BitBLASQuantLinear(BaseQuantLinear):
         self.group_size = self._set_group_size(group_size, infeatures)
         self.opt_features = opt_features
         self.target = BITBLAS_TARGET
+        # added
+        self.eng_tag = (
+            f"{infeatures}x{outfeatures}" + "_" + str(self.bits) + "_" + str(self.group_size)
+        )
         self._configure_bitblas_matmul(
             enable_tuning, fast_decoding, bias, propagate_b, layout, bits
         )
         self._initialize_buffers(infeatures, outfeatures, bias)
         self.reset_parameters()
+        
 
     def _validate_parameters(
         self, group_size: int, infeatures: int, outfeatures: int
@@ -195,9 +237,14 @@ class BitBLASQuantLinear(BaseQuantLinear):
             layout=layout,
             zeros_mode=self.zeros_mode,
         )
-        self.bitblas_matmul = self._get_or_create_bitblas_operator(
-            matmul_config, enable_tuning
-        )
+        
+        if self.eng_tag not in BitBLASQuantLinear.ENG_CACHE:
+            self.bitblas_matmul = self._get_or_create_bitblas_operator(
+                matmul_config, enable_tuning
+            )
+            BitBLASQuantLinear.ENG_CACHE[self.eng_tag] = self.bitblas_matmul
+        else:
+            self.bitblas_matmul = BitBLASQuantLinear.ENG_CACHE[self.eng_tag]
 
     def _get_or_create_bitblas_operator(self, config, enable_tuning):
         from bitblas import Matmul
@@ -243,11 +290,11 @@ class BitBLASQuantLinear(BaseQuantLinear):
 
     def post_init(self):
         self.validate_device(self.qweight.device.type)
-        # eliminate runtime overhead like exllama state
-        param_list = [self.qweight, self.scales, self.zeros]
-        if self.bitblas_matmul.config.with_bias:
-            param_list.append(self.bias)
-        self.q_params = [ctypes.c_void_p(arr.data_ptr()) for arr in param_list]
+        # # eliminate runtime overhead like exllama state
+        # param_list = [self.qweight, self.scales, self.zeros]
+        # if self.bitblas_matmul.config.with_bias:
+        #     param_list.append(self.bias)
+        # self.q_params = [ctypes.c_void_p(arr.data_ptr()) for arr in param_list]
 
     def pack(self, linear, scales, zeros, g_idx=None):
         from bitblas.quantization.utils import general_compress
@@ -285,8 +332,9 @@ class BitBLASQuantLinear(BaseQuantLinear):
         qweight = qweight.astype(np.int32)
         qweight = torch.from_numpy(qweight)
         qweight = qweight.T.contiguous().view(self.TORCH_STORAGE_DTYPE)
+        intweight = unpack_qweight(qweight, self.bits).contiguous()
         if self.bitblas_matmul.weight_transform is not None:
-            qweight = self.bitblas_matmul.weight_transform(qweight.cpu()).cuda()
+            qweight = self.bitblas_matmul.weight_transform(intweight.cpu()).cuda()
         self.qweight = qweight
 
         scales = self.scales.T.contiguous().view(self.TORCH_DTYPE)
@@ -332,8 +380,9 @@ class BitBLASQuantLinear(BaseQuantLinear):
 
         # qweight in gptq old quant linear stored with (outfeatures, infeatures), should be transposed.
         qweight = gptq_module.qweight.T.contiguous().view(self.TORCH_STORAGE_DTYPE)
+        intweight = unpack_qweight(qweight, self.bits).contiguous()
         if self.bitblas_matmul.weight_transform is not None:
-            qweight = self.bitblas_matmul.weight_transform(qweight.cpu()).cuda()
+            qweight = self.bitblas_matmul.weight_transform(intweight.cpu()).cuda()
         self.qweight = qweight
         # scales in gptq old quant linear stored with (infeatures // group_size, outfeatures), should be transposed.
         scales = gptq_module.scales.T.contiguous().view(self.TORCH_DTYPE)
@@ -359,21 +408,32 @@ class BitBLASQuantLinear(BaseQuantLinear):
             )
         if self.bias is not None:
             self.bias = gptq_module.bias.data.to(torch.float16).contiguous()
-
-    def forward(self, A):
-        if A.dtype != torch.float16:
-            A = A.half()
-
-        C = torch.empty(
-            A.shape[:-1] + (self.scales.shape[0],), dtype=A.dtype, device=A.device
+    
+    def matmul(self, x: Tensor) -> Tensor:
+        return matmul_bitblas(
+            x.to(self.qweight.device), self.qweight, self.scales, self.zeros, self.outfeatures, self.eng_tag
         )
-        A_void = ctypes.c_void_p(A.data_ptr())
-        # m is the product of the last n - 1 dimensions of A
-        m = ctypes.c_int32(reduce(operator.mul, A.shape[:-1], 1))
-        self.bitblas_matmul.call_lib(
-            A_void , *self.q_params, ctypes.c_void_p(C.data_ptr()), m
-        )
-        return C
+        
+    def forward(self, x: Tensor) -> Tensor:
+        out = self.matmul(x)
+        if self.bias is not None:
+            out += self.bias
+        return out
+    
+    # def forward(self, A):
+    #     if A.dtype != torch.float16:
+    #         A = A.half()
+
+    #     C = torch.empty(
+    #         A.shape[:-1] + (self.scales.shape[0],), dtype=A.dtype, device=A.device
+    #     )
+    #     A_void = ctypes.c_void_p(A.data_ptr())
+    #     # m is the product of the last n - 1 dimensions of A
+    #     m = ctypes.c_int32(reduce(operator.mul, A.shape[:-1], 1))
+    #     self.bitblas_matmul.call_lib(
+    #         A_void , *self.q_params, ctypes.c_void_p(C.data_ptr()), m
+    #     )
+    #     return C
 
 
 __all__ = ["BitBLASQuantLinear"]
