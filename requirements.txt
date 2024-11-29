@@ -18,3 +18,7 @@ auto-round==0.3
 huggingface-hub>=0.24.2
 lm_eval==0.4.4
 liger-kernel>=0.3.0
+fschat
+openai
+antro
+anthropic

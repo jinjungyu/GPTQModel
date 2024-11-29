@@ -470,8 +470,9 @@ def _load_model(checkpoint_path, device, precision):
 def main():
     parser = ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
-    parser.add_argument("--tokenizer_name_or_path", type=str, default=None)
-    parser.add_argument("--from_pretrained", action="store_true")
+    parser.add_argument("--quantized_path", type=str, default=None)
+    # parser.add_argument("--tokenizer_name_or_path", type=str, default=None)
+    # parser.add_argument("--from_pretrained", action="store_true")
     parser.add_argument("--model_basename", type=str, default=None)
     parser.add_argument("--quantize_config_save_dir", type=str, default=None)
     parser.add_argument("--trust_remote_code", action="store_true")
@@ -487,7 +488,8 @@ def main():
     # added
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
-    parser.add_argument("--draft_checkpoint_path", type=str, default=None)
+    parser.add_argument("--draft_model_name_or_path", type=str)
+    parser.add_argument("--draft_quantized_path", type=str, default=None)
     parser.add_argument("--speculate_k", type=int, default=5)
     parser.add_argument('--autogptq', action='store_true', help='use AutoGPTQ, not GPTQModel')
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -521,16 +523,22 @@ def main():
     else:
         pth_name = 'model.pth'
         
-    # fast model
-    torchao.quantization.utils.recommended_inductor_config_setter()
-    model_torchao = Transformer.from_name(Path('/SSD/JG/checkpoints') / args.tokenizer_name_or_path)
-    model_torchao.load_state_dict(torch.load(Path('/SSD/JG/checkpoints') / args.tokenizer_name_or_path / pth_name, mmap=True, weights_only=True), assign=True)
+    # for fast model loading
+    def skip(*args, **kwargs):
+        pass
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
     
-    if not args.from_pretrained:
+    torchao.quantization.utils.recommended_inductor_config_setter()
+    model_torchao = Transformer.from_name(args.model_name_or_path)
+    model_torchao.load_state_dict(torch.load(Path(args.model_name_or_path) / pth_name, mmap=True, weights_only=True), assign=True)
+    
+    if args.quantized_path:
         model, tokenizer = load_model_tokenizer(
-            model_name_or_path=args.model_name_or_path,
-            tokenizer_name_or_path=args.tokenizer_name_or_path,
-            from_pretrained=args.from_pretrained,
+            model_name_or_path=args.quantized_path,
+            tokenizer_name_or_path=args.model_name_or_path,
+            from_pretrained=False,
             max_memory=max_memory,
             model_basename=args.model_basename,
             quantize_config=quantize_config,
@@ -561,7 +569,7 @@ def main():
         del model
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path=args.tokenizer_name_or_path or args.model_name_or_path,
+        pretrained_model_name_or_path=args.model_name_or_path,
         use_fast=args.use_fast_tokenizer,
         trust_remote_code=args.trust_remote_code,
         )
@@ -586,11 +594,6 @@ def main():
     
     # mtbench questions
     examples = load_questions('/NAS/JG/QAS4SD/GPTQModel/examples/benchmark/mtbench_question.jsonl', 0, args.num_samples) # single question
-    # examples = load_data(
-    #     tokenizer,
-    #     args.num_samples,
-    #     args.max_new_tokens,
-    # )
     
     end = time.perf_counter()
     logger.info(f"model and tokenizer loading time: {end - start:.4f}s")
@@ -603,17 +606,14 @@ def main():
     # quantize_(model, int4_weight_only(group_size=128))
     # import code; code.interact(f'model', local=dict(globals(), **locals()))
     
-    is_speculative = args.draft_checkpoint_path is not None
+    is_speculative = args.draft_model_name_or_path is not None
     if is_speculative:
-        if '68m' in args.draft_checkpoint_path:
-            draft_model = _load_model(Path(args.draft_checkpoint_path) / pth_name, device, torch.half)
-        else:
-            draft_model_torchao = Transformer.from_name(Path('/SSD/JG/checkpoints') / args.tokenizer_name_or_path)
-            draft_model_torchao.load_state_dict(torch.load(Path('/SSD/JG/checkpoints') / args.tokenizer_name_or_path / pth_name, mmap=True, weights_only=True), assign=True)
-            
+        draft_model_torchao = Transformer.from_name(Path(args.draft_model_name_or_path))
+        draft_model_torchao.load_state_dict(torch.load(Path(args.draft_model_name_or_path) / pth_name, mmap=True, weights_only=True), assign=True)
+        if args.draft_quantized_path is not None:
             draft_model, _ = load_model_tokenizer(
-                model_name_or_path=args.draft_checkpoint_path,
-                tokenizer_name_or_path=args.tokenizer_name_or_path,
+                model_name_or_path=args.draft_quantized_path,
+                tokenizer_name_or_path=args.draft_model_name_or_path,
                 from_pretrained=False,
                 max_memory=max_memory,
                 model_basename=args.model_basename,
@@ -653,6 +653,8 @@ def main():
                     layer.feed_forward.w1.post_init()
                     layer.feed_forward.w3.post_init()
                     layer.feed_forward.w2.post_init()
+        else:
+            draft_model = draft_model_torchao.half().to(device)
     else:
         draft_model = None
         

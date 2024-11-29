@@ -1,3 +1,66 @@
+<h1 align="center">GPTQModel+TorchAO Customized Framework</h1>
+
+## 0. Installation
+```bash
+git clone https://github.com/jinjungyu/GPTQModel.git
+cd GPTQModel
+pip install -vvv --no-build-isolation -e .
+```
+* Clone torchao to current directory
+```bash
+git clone https://github.com/jinjungyu/ao.git
+```
+
+## 1-1. Prepare TorchAO Model
+```bash
+# download model
+HF_HOME='' python torchao/scripts/download.py --repo_id meta-llama/Llama-2-7b-chat-hf --save_dir ./checkpoints --hf_token {huggingface_llama2_authorized_token}
+
+# convert hf format to torchao format
+python torchao/scripts/convert_hf_checkpoint.py --checkpoint_dir ./checkpoints/meta-llama/Llama-2-7b-chat-hf
+```
+
+## 1-2. Prepare Quantized model
+```bash
+# 4bit
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/quantization/basic_usage.py --model_name_or_path meta-llama/Llama-2-7b-chat-hf --bits 4 --group_size 128 --save_quantized_path ./checkpoints/llama-2-7b-chat-w4-g128-asym-bitblas --backend BITBLAS --asym
+
+# 2bit
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/quantization/basic_usage.py --model_name_or_path meta-llama/Llama-2-7b-chat-hf --bits 2 --group_size 32 --save_quantized_path ./checkpoints/llama-2-7b-chat-w2-g32-asym-bitblas --backend BITBLAS --asym
+```
+
+## 2. Generation Benchmark
+### 2-1. Auto-Regressive
+```bash
+# FP16
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/benchmark/generation_speed_optimize.py --model_name_or_path ./checkpoints/meta-llama/Llama-2-7b-chat-hf --backend BITBLAS --compile
+
+# 4bit
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/benchmark/generation_speed_optimize.py --model_name_or_path ./checkpoints/meta-llama/Llama-2-7b-chat-hf --quantized_path ./checkpoints/llama-2-7b-chat-w4-g128-asym-bitblas --backend BITBLAS --compile
+
+# 2bit
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/benchmark/generation_speed_optimize.py --model_name_or_path ./checkpoints/meta-llama/Llama-2-7b-chat-hf --quantized_path ./checkpoints/llama-2-7b-chat-w2-g64-asym-bitblas --backend BITBLAS --compile
+```
+
+### 2-2. SpS
+#### 2-2-1. FP16 - small FP16
+```bash
+# download small model
+HF_HOME='' python torchao/scripts/download.py --repo_id double7/vicuna-68m --save_dir ./checkpoints --hf_token {huggingface_authorized_token}
+
+# convert hf format to torchao format
+python torchao/scripts/convert_hf_checkpoint.py --checkpoint_dir ./checkpoints/double7/vicuna-68m
+
+# SpS
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/benchmark/generation_speed_optimize.py --model_name_or_path ./checkpoints/meta-llama/Llama-2-7b-chat-hf --draft_model_name_or_path ./checkpoints/double7/vicuna-68m --backend BITBLAS --compile
+```
+
+#### 2-2-2. FP16 - INT4
+```bash
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID python examples/benchmark/generation_speed_optimize.py --model_name_or_path ./checkpoints/meta-llama/Llama-2-7b-chat-hf --draft_model_name_or_path ./checkpoints/meta-llama/Llama-2-7b-chat-hf --draft_quantized_path ./checkpoints/llama-2-7b-chat-w4-g128-asym-bitblas --backend BITBLAS --compile
+```
+
+
 <h1 align="center">GPTQModel</h1>
 <p align="center">GPTQ based LLM model compression/quantization toolkit with accelerated inference support for both cpu/gpu via HF, vLLM, and SGLang.</p>
 <p align="center">
