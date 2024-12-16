@@ -32,6 +32,7 @@ from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
 import contextlib
 import copy
 import accelerate
+from glob import glob
 
 from fastchat.llm_judge.common import load_questions
 from fastchat.model import get_conversation_template
@@ -593,7 +594,7 @@ def main():
             layer.feed_forward.w2.post_init()
     
     # mtbench questions
-    examples = load_questions('/NAS/JG/QAS4SD/GPTQModel/examples/benchmark/mtbench_question.jsonl', 0, args.num_samples) # single question
+    examples = load_questions(glob('**/mtbench_question.jsonl', recursive=True)[0], 0, args.num_samples) # single question
     
     end = time.perf_counter()
     logger.info(f"model and tokenizer loading time: {end - start:.4f}s")
@@ -604,6 +605,13 @@ def main():
     #     )
     # model = model.to(device=device, dtype=torch.bfloat16)
     # quantize_(model, int4_weight_only(group_size=128))
+    def get_memory_footprint(module, return_buffers=True):
+        mem = sum([param.nelement() * param.element_size() for param in module.parameters()])
+        if return_buffers:
+            mem_bufs = sum([buf.nelement() * buf.element_size() for buf in module.buffers()])
+            mem = mem + mem_bufs
+        return mem
+    print(f"Model memory : {get_memory_footprint(model) / 1024 / 1024 / 1024} GB")
     # import code; code.interact(f'model', local=dict(globals(), **locals()))
     
     is_speculative = args.draft_model_name_or_path is not None
