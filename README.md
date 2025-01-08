@@ -20,6 +20,17 @@ HF_HOME='' python torchao/scripts/download.py --repo_id meta-llama/Llama-2-7b-ch
 python torchao/scripts/convert_hf_checkpoint.py --checkpoint_dir ./checkpoints/meta-llama/Llama-2-7b-chat-hf
 ```
 
+## HQQ Quantization + Benchmark
+```bash
+git clone https://github.com/jinjungyu/hqq.git
+cd hqq
+pip install .
+```
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python examples/benchmark/generation_speed_optimize_hqq.py --model_name_or_path /SSD/JG/checkpoints/meta-llama/Llama-2-7b-chat-hf --compile --bit 4
+```
+
 ## 1-2. Prepare Quantized model
 ```bash
 # 4bit
